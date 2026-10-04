@@ -1,0 +1,125 @@
+"""Network request/response interceptor for Playwright."""
+import logging
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
+
+from playwright.async_api import Request, Response
+
+from . import auth_analyzer
+
+logger = logging.getLogger(__name__)
+
+
+class NetworkInterceptor:
+    """Intercept and store network requests/responses."""
+
+    def __init__(self):
+        self.requests: List[Dict[str, Any]] = []
+
+    async def handle_request(self, request: Request, page_url: str) -> Dict[str, Any]:
+        """Build the capture record for `request`.
+
+        `page_url` is the URL of the page the request was issued from, read by
+        the caller at the moment the request event fires.
+        """
+        return {
+            # Query, fragment and userinfo dropped; detection below sees the full URL.
+            'url': auth_analyzer.strip_url(request.url),
+            'method': request.method,
+            'resource_type': request.resource_type,
+            'page_url': page_url,
+            'authentication': auth_analyzer.detect_authentication(request.headers, request.url),
+            # The scheme word the Authorization header carried, kept as
+            # evidence; the credentials after it are never recorded.
+            'sent_auth_scheme': auth_analyzer.sent_auth_scheme(request.headers),
+        }
+
+    async def handle_response(
+        self,
+        request_data: Dict[str, Any],
+        response: Optional[Response] = None,
+    ) -> Dict[str, Any]:
+        try:
+            if response is None:
+                raise ValueError("Response is None")
+            if not hasattr(response, 'status'):
+                raise ValueError(f"Response object is invalid: {type(response)}")
+
+            status = response.status if hasattr(response, 'status') else 0
+            try:
+                headers = response.headers
+                if hasattr(headers, '__await__'):
+                    headers = await headers
+            except Exception:
+                headers = {}
+
+            response_data = {'status': status}
+
+            if status == 401:
+                self._apply_auth_challenge(headers, request_data, response_data)
+
+            if status in (301, 302, 303, 307, 308):
+                self._apply_redirect(headers, request_data, response_data)
+
+            # Built as a separate dict and merged only once every field is
+            # resolved, so a mid-flight failure leaves no partial response keys
+            # on the request.
+            request_data.update(response_data)
+            self.requests.append(request_data)
+            return request_data
+        except Exception as e:
+            logger.error("Error handling response for %s: %s", request_data.get('url'), e, exc_info=True)
+            status = 0
+            if response and hasattr(response, 'status'):
+                try:
+                    status = response.status
+                except Exception:
+                    status = 0
+
+            request_data['status'] = status
+            if request_data not in self.requests:
+                self.requests.append(request_data)
+            return request_data
+
+    def _apply_auth_challenge(self, headers, request_data, response_data) -> None:
+        auth_challenge = self._get_header_value(headers, 'WWW-Authenticate')
+        if not auth_challenge:
+            return
+        response_data['auth_challenge'] = auth_challenge
+        # This runs only on a 401, which means whatever credential the request
+        # carried (if any) was rejected -- so the server's challenge, not the
+        # failed sent scheme, is the authoritative label. Promote it even over a
+        # concrete detected auth like "bearer": a rejected credential must not
+        # masquerade as accepted. The label is the resolved scheme alone, while the
+        # raw challenge lives in the 'auth_challenge' key set above for evidence.
+        request_data['authentication'] = auth_analyzer.detect_auth_challenge(auth_challenge)
+
+    def _apply_redirect(self, headers, request_data, response_data) -> None:
+        location = self._get_header_value(headers, 'Location')
+        if not location:
+            return
+        # Every redirect's target is kept, resolved against the request URL so
+        # a relative Location is comparable with 'url', and stripped like it:
+        # a Location is where OAuth state/nonce/login_hint, authorization
+        # codes, implicit-flow tokens (in the fragment) and SAMLRequest travel.
+        response_data['redirect_url'] = auth_analyzer.strip_url(
+            urljoin(request_data.get('url', ''), location)
+        )
+        if auth_analyzer.is_idp_redirect(location):
+            # As in _apply_auth_challenge, the label carries only the resolved
+            # scheme; the target lives in the 'redirect_url' key set above for
+            # evidence.
+            request_data['authentication'] = "oauth"
+
+    @staticmethod
+    def _get_header_value(headers: Dict[str, str], name: str) -> Optional[str]:
+        for k, v in headers.items():
+            if k.lower() == name.lower():
+                return v
+        return None
+
+    def get_requests(self) -> List[Dict[str, Any]]:
+        return self.requests.copy()
+
+    def clear(self):
+        self.requests.clear()

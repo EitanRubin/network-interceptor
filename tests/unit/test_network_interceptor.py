@@ -1,0 +1,249 @@
+"""Tests for crawler.network.NetworkInterceptor."""
+import pytest
+from unittest.mock import MagicMock
+
+from crawler.network import NetworkInterceptor
+
+
+@pytest.fixture
+def interceptor():
+    return NetworkInterceptor()
+
+
+class TestHandleRequest:
+    async def test_returns_expected_keys(self, interceptor, mock_request):
+        req = mock_request("GET", headers={"authorization": "Bearer abc"})
+        result = await interceptor.handle_request(req, "http://example.com")
+        assert result["url"] == "http://api.example.com/v1/test"
+        assert result["method"] == "GET"
+        assert result["authentication"] == "bearer"
+        assert result["sent_auth_scheme"] == "Bearer"
+        assert result["page_url"] == "http://example.com"
+        assert result["resource_type"] == "fetch"
+
+    async def test_sent_auth_scheme_is_none_without_authorization(self, interceptor, mock_request):
+        req = mock_request("GET", headers={"x-api-key": "k"})
+        result = await interceptor.handle_request(req, "http://example.com")
+        assert result["authentication"] == "api_key"
+        assert result["sent_auth_scheme"] is None
+
+    async def test_url_is_stripped_but_detection_sees_it_whole(self, interceptor, mock_request):
+        req = mock_request("GET", url="http://user:pw@api.example.com/v1/search?api_key=secret#frag")
+        result = await interceptor.handle_request(req, "http://example.com")
+        assert result["url"] == "http://api.example.com/v1/search"
+        assert result["authentication"] == "api_key"
+        assert "secret" not in repr(result)
+
+
+class TestHandleResponse:
+    async def test_200(self, interceptor, mock_response):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(req_data, mock_response(200))
+        assert result["status"] == 200
+        assert len(interceptor.requests) == 1
+
+    async def test_401_basic(self, interceptor, mock_response):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(401, {"www-authenticate": 'Basic realm="test"'})
+        )
+        assert result["authentication"] == "basic"
+
+    async def test_401_bearer(self, interceptor, mock_response):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(401, {"www-authenticate": 'Bearer realm="api"'})
+        )
+        assert result["authentication"] == "bearer"
+
+    async def test_401_negotiate(self, interceptor, mock_response):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(401, {"www-authenticate": "Negotiate"})
+        )
+        assert result["authentication"] == "negotiate"
+
+    async def test_401_ntlm(self, interceptor, mock_response):
+        # A bare "WWW-Authenticate: NTLM" challenge is labeled explicitly rather
+        # than falling into the "other" bucket, so the raw authentication field
+        # names the scheme honestly.
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(401, {"www-authenticate": "NTLM"})
+        )
+        assert result["authentication"] == "ntlm"
+
+    async def test_401_other_scheme(self, interceptor, mock_response):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(401, {"www-authenticate": 'Digest realm="t"'})
+        )
+        # A scheme we don't name specifically is tagged "other"; the raw challenge
+        # is kept for evidence alongside it, not folded into the label.
+        assert result["authentication"] == "other"
+        assert result["auth_challenge"] == 'Digest realm="t"'
+
+    async def test_401_multiple_challenges(self, interceptor, mock_response):
+        # IIS Windows Authentication sends Negotiate and NTLM as two headers;
+        # Playwright's response.headers joins repeated headers with ", ", so
+        # they arrive as one list. The label is the most favorable scheme
+        # offered, since the server takes either; the evidence keeps the whole
+        # list so the NTLM offer stays visible.
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(401, {"www-authenticate": "Negotiate, NTLM"})
+        )
+        assert result["authentication"] == "negotiate"
+        assert result["auth_challenge"] == "Negotiate, NTLM"
+
+    async def test_401_ntlm_handshake_continuation_stays_ntlm(self, interceptor, mock_response):
+        # Mid-handshake the request carried an NTLM Type 1 inside Negotiate and
+        # was labeled "ntlm"; the 401 carrying the Type 2 must not relabel it.
+        req_data = {"url": "http://a.com", "authentication": "ntlm"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(401, {"www-authenticate": "Negotiate TlRMTVNTUAACAAAA"})
+        )
+        assert result["authentication"] == "ntlm"
+
+    async def test_401_without_header(self, interceptor, mock_response):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(req_data, mock_response(401, {}))
+        assert result["authentication"] == "unauthenticated"
+
+    async def test_401_overwrites_rejected_credential(self, interceptor, mock_response):
+        # A 401 means the sent credential was rejected, so the server's challenge
+        # -- not the failed "bearer" -- is the authoritative label. The raw
+        # challenge is still recorded for evidence.
+        req_data = {"url": "http://a.com", "authentication": "bearer"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(401, {"www-authenticate": "Basic"})
+        )
+        assert result["authentication"] == "basic"
+        assert result["auth_challenge"] == "Basic"
+
+    async def test_401_bearer_rejected_by_negotiate(self, interceptor, mock_response):
+        # The motivating scenario: a bearer token met with a Negotiate challenge.
+        # The rejected bearer must not stick as the request's auth.
+        req_data = {"url": "http://a.com", "authentication": "bearer"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(401, {"www-authenticate": "Negotiate"})
+        )
+        assert result["authentication"] == "negotiate"
+
+    async def test_302_idp(self, interceptor, mock_response):
+        # The label carries only the scheme; the target stays in 'redirect_url'.
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(302, {"location": "https://x.auth0.com/authorize"})
+        )
+        assert result["authentication"] == "oauth"
+        assert result["redirect_url"] == "https://x.auth0.com/authorize"
+
+    async def test_307_idp(self, interceptor, mock_response):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(307, {"location": "https://login.microsoftonline.com/t/oauth2"})
+        )
+        assert result["authentication"] == "oauth"
+        assert result["redirect_url"] == "https://login.microsoftonline.com/t/oauth2"
+
+    async def test_302_relative_oauth_location(self, interceptor, mock_response):
+        # A same-origin relative redirect to an authorization endpoint still
+        # classifies, and its target is resolved against the request URL.
+        req_data = {"url": "http://a.com/app/page", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(302, {"location": "/oauth/authorize"})
+        )
+        assert result["authentication"] == "oauth"
+        assert result["redirect_url"] == "http://a.com/oauth/authorize"
+
+    async def test_301_non_idp(self, interceptor, mock_response):
+        # A redirect that is no IdP handoff leaves the label alone but still
+        # records its target.
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(301, {"location": "https://example.com/new"})
+        )
+        assert result["authentication"] == "unauthenticated"
+        assert result["redirect_url"] == "https://example.com/new"
+
+    @pytest.mark.parametrize("location, expected", [
+        ("login", "https://a.com/app/login"),
+        ("../login", "https://a.com/login"),
+        ("//b.com/x", "https://b.com/x"),
+    ])
+    async def test_relative_location_resolved(self, interceptor, mock_response, location, expected):
+        req_data = {"url": "https://a.com/app/page", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(302, {"location": location})
+        )
+        assert result["redirect_url"] == expected
+
+    async def test_redirect_url_is_stripped(self, interceptor, mock_response):
+        # Authorization codes, tokens and OAuth parameters ride in a Location's
+        # query and fragment; none of it may reach the stored record.
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(302, {
+                "location": "https://u:pw@app.example.com/cb?code=secret1&state=s#access_token=secret2",
+            })
+        )
+        assert result["redirect_url"] == "https://app.example.com/cb"
+        assert "secret" not in repr(result)
+
+    async def test_302_without_location(self, interceptor, mock_response):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(req_data, mock_response(302, {}))
+        assert "redirect_url" not in result
+
+    async def test_non_redirect_location_ignored(self, interceptor, mock_response):
+        # A 201's Location names a created resource, not a redirect.
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(
+            req_data, mock_response(201, {"location": "https://a.com/items/1"})
+        )
+        assert "redirect_url" not in result
+
+    async def test_none_response(self, interceptor):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        result = await interceptor.handle_response(req_data, None)
+        assert result["status"] == 0
+
+    async def test_none_response_not_duplicated(self, interceptor):
+        req_data = {"url": "http://a.com", "authentication": "unauthenticated"}
+        await interceptor.handle_response(req_data, None)
+        await interceptor.handle_response(req_data, None)
+        assert interceptor.requests.count(req_data) == 1
+
+    async def test_appended_to_list(self, interceptor, mock_response):
+        for i in range(3):
+            req_data = {"url": f"http://a.com/{i}", "authentication": "unauthenticated"}
+            await interceptor.handle_response(req_data, mock_response(200))
+        assert len(interceptor.requests) == 3
+
+
+class TestGetHeaderValue:
+    def test_case_insensitive(self, interceptor):
+        headers = {"Content-Type": "application/json", "X-Custom": "v"}
+        assert interceptor._get_header_value(headers, "content-type") == "application/json"
+        assert interceptor._get_header_value(headers, "x-custom") == "v"
+        assert interceptor._get_header_value(headers, "missing") is None
+
+    def test_empty(self, interceptor):
+        assert interceptor._get_header_value({}, "x") is None
+
+
+class TestInterceptorState:
+    def test_get_requests_returns_copy(self, interceptor):
+        interceptor.requests.append({"url": "http://a"})
+        copy = interceptor.get_requests()
+        copy.append({"url": "http://b"})
+        assert len(interceptor.requests) == 1
+
+    def test_clear(self, interceptor):
+        interceptor.requests.extend([{"url": "a"}, {"url": "b"}])
+        interceptor.clear()
+        assert interceptor.requests == []
+
+    def test_initial_state(self, interceptor):
+        assert interceptor.requests == []
