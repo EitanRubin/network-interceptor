@@ -5,7 +5,7 @@ from urllib.parse import urljoin
 
 from config_tracer.report import ScanReport, ServiceReport, UrlEvidence
 
-from .enums import AuthMethod, Scanner, Severity
+from .enums import AuthMethod, Scanner, Severity, SourceKind
 
 # urls.resource_type of a tracer row: a probe the tracer sent, where an
 # interceptor row names what the browser was loading ("xhr", "script").
@@ -13,7 +13,7 @@ PROBE_RESOURCE_TYPE = "probe"
 
 # The tracer's provenance kinds that name a URL after the colon. "dom:" names
 # an element of the page instead.
-_URL_SOURCE_KINDS = ("network", "js", "redirect", "synthesized")
+_URL_SOURCE_KINDS = (SourceKind.network, SourceKind.js, SourceKind.redirect, SourceKind.synthesized)
 
 
 def tag_to_auth_method(tag: str) -> AuthMethod:
@@ -43,28 +43,33 @@ def tag_to_auth_method(tag: str) -> AuthMethod:
 def severity_for(auth_method: AuthMethod) -> Severity:
     """Severity of an origin's auth method for the F5 publish.
 
-    Read as a whitelist: only the named, supported schemes clear. A scheme
-    known to be unsupported (NTLM, Basic) blocks, and so does "other", a real
-    scheme the crawler could not name: not on the supported list means
-    unsupported until someone names it in the detector. Review is for what
+    A whitelist: only the named, supported schemes clear. A scheme known to
+    be unsupported (NTLM, Basic) blocks, and so does "other", a real scheme
+    the crawler could not name: not on the supported list means unsupported
+    until someone names it in the detector. Everything else is review, what
     cannot be told yet -- "negotiate" is SPNEGO whose mechanism (Kerberos or
     NTLM) went unresolved, "no_response" is an origin none of whose requests
     got an answer, "dns_failed" is an origin whose host the tracer could not
     resolve, and "unknown" is an answer that names no scheme: from the tracer
     a bare 401, a coarse 4xx or a 5xx, from the interceptor a producer that
     drifted from the vocabulary. The manual auth-method override exists to
-    fill in the last three.
+    fill in the last three. An AuthMethod added without a tier here lands on
+    review as well, in front of a human, rather than clearing unexamined.
+    Never "published": that comes from the published-origins registry
+    (core.jobs._recompute_services), not from a method.
     """
     if auth_method in (AuthMethod.ntlm, AuthMethod.basic, AuthMethod.other):
         return Severity.blocker
     if auth_method in (
-        AuthMethod.negotiate,
-        AuthMethod.no_response,
-        AuthMethod.dns_failed,
-        AuthMethod.unknown,
+        AuthMethod.kerberos,
+        AuthMethod.bearer,
+        AuthMethod.oauth,
+        AuthMethod.login_redirect,
+        AuthMethod.api_key,
+        AuthMethod.unauthenticated,
     ):
-        return Severity.review
-    return Severity.cleared
+        return Severity.cleared
+    return Severity.review
 
 
 def service_to_row(scan_id: str, service: Dict[str, Any]) -> Dict[str, Any]:
@@ -89,6 +94,8 @@ def service_to_row(scan_id: str, service: Dict[str, Any]) -> Dict[str, Any]:
         # Filled in by services_to_rows once the url rows have ids.
         "evidence_url_id": None,
         "excluded": False,
+        # Set by core.jobs._recompute_services from the registry.
+        "published_origin_id": None,
     }
 
 
@@ -150,15 +157,34 @@ def _strip_url(url: str) -> str:
     return strip_url(url)
 
 
+def parse_source(source: str) -> Tuple[SourceKind, str]:
+    """A tracer provenance string, one of urls.sources, as (kind, what it
+    names): the URL of a config, bundle or probed URL, or for dom the page
+    element, in prose.
+
+    Strict, like the verdict in tracer_url_to_row: a string that names no kind
+    of the tracer's is a producer that drifted, and raises ValueError here, at
+    write time, rather than failing every read of its service's sources."""
+    kind, sep, named = source.partition(": ")
+    try:
+        parsed = SourceKind(kind) if sep else None
+    except ValueError:
+        parsed = None
+    # page is the interceptor's kind, never a stored string.
+    if parsed is None or parsed is SourceKind.page:
+        raise ValueError(f"tracer provenance outside the vocabulary: {source!r}")
+    return parsed, named
+
+
 def _strip_source(source: str) -> str:
     """A tracer provenance string with the URL it names stripped like urls.url.
 
     `redirect:` and `synthesized:` repeat a probed URL and `network:` and `js:`
     name a response the page loaded, so each can carry the query string that
     was stripped from the url column."""
-    kind, sep, url = source.partition(": ")
-    if sep and kind in _URL_SOURCE_KINDS:
-        return f"{kind}: {_strip_url(url)}"
+    kind, named = parse_source(source)
+    if kind in _URL_SOURCE_KINDS:
+        return f"{kind.value}: {_strip_url(named)}"
     return source
 
 
@@ -220,6 +246,8 @@ def _tracer_service_to_row(scan_id: str, service: ServiceReport) -> Dict[str, An
         # Filled in by tracer_report_to_rows once the url rows have ids.
         "evidence_url_id": None,
         "excluded": False,
+        # Set by core.jobs._recompute_services from the registry.
+        "published_origin_id": None,
     }
 
 

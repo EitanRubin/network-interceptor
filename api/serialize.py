@@ -1,20 +1,30 @@
 """Helpers that turn ORM rows into the shapes the frontend expects."""
 from datetime import datetime, timezone
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
-from core.db import AppRow, ScanJobRow, ScanRow, ServiceFindingRow, ServiceRow, UrlRow
-from core.enums import AuthMethod, JobStatus, Scanner, Severity
-from core.translate import severity_for
+from core.db import (
+    AppRow,
+    PublishedOriginRow,
+    ScanJobRow,
+    ScanRow,
+    ServiceFindingRow,
+    ServiceRow,
+    UrlRow,
+)
+from core.enums import AuthMethod, JobStatus, Scanner, Severity, SourceKind
+from core.translate import parse_source, severity_for
 
 from .models import (
     AppSummary,
     ExposureState,
     Finding,
+    PublishedOrigin,
     ScanDetail,
     ScanJob,
     ScanStatus,
     ScanSummary,
     Service,
+    Source,
     Url,
 )
 
@@ -38,14 +48,32 @@ def finding_to_schema(row: ServiceFindingRow, evidence: UrlRow | None) -> Findin
     )
 
 
+def published_origin_to_schema(row: PublishedOriginRow) -> PublishedOrigin:
+    return PublishedOrigin(
+        id=row.id,
+        scheme=row.scheme,
+        host=row.host,
+        port=row.port,
+        note=row.note,
+        added_by=row.added_by,
+        added_at=_isoformat(row.added_at),
+        removed_at=_isoformat(row.removed_at),
+        removed_by=row.removed_by,
+    )
+
+
 def service_to_schema(
     row: ServiceRow,
     evidence: UrlRow | None,
     findings: Sequence[Tuple[ServiceFindingRow, UrlRow | None]],
+    urls: Sequence[UrlRow],
+    published_origin: PublishedOriginRow | None = None,
 ) -> Service:
     """`evidence` is the url row `row.evidence_url_id` points at, or None when it
     points nowhere. `findings` is each scanner's finding for the service with
-    the url row its own evidence_url_id points at. The caller loads them
+    the url row its own evidence_url_id points at. `urls` is every url row of
+    the service. `published_origin` is the registry entry
+    `row.published_origin_id` points at, or None. The caller loads them
     (db.load_services)."""
     return Service(
         id=row.id,
@@ -59,8 +87,29 @@ def service_to_schema(
         evidence=url_to_schema(evidence) if evidence is not None else None,
         found_by=[Scanner(finding.scanner) for finding, _ in findings],
         findings=[finding_to_schema(finding, url) for finding, url in findings],
+        sources=sources_to_schema(urls),
         excluded=row.excluded,
+        published_origin=(
+            published_origin_to_schema(published_origin) if published_origin is not None else None
+        ),
     )
+
+
+def sources_to_schema(urls: Sequence[UrlRow]) -> List[Source]:
+    """Everywhere the scanners found a service's origin, from its url rows:
+    each tracer row's provenance strings, parsed, and the page each interceptor
+    row was captured on. A source two rows share is listed once, and the list
+    is sorted by kind then value, so it reads the same however the rows came
+    out of the table."""
+    found: set[tuple[SourceKind, str]] = set()
+    for url in urls:
+        found.update(parse_source(source) for source in url.sources)
+        if url.page_url:
+            found.add((SourceKind.page, url.page_url))
+    return [
+        Source(kind=kind, value=value)
+        for kind, value in sorted(found, key=lambda source: (source[0].value, source[1]))
+    ]
 
 
 def url_to_schema(row: UrlRow) -> Url:

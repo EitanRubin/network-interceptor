@@ -5,8 +5,9 @@ from config_tracer.models import AuthMethod as TracerAuthMethod
 from config_tracer.models import HttpMethod, Origin
 from config_tracer.report import ScanReport, ServiceReport, UrlEvidence
 from core.db import ServiceRow, UrlRow
-from core.enums import AuthMethod, Severity
+from core.enums import AuthMethod, Severity, SourceKind
 from core.translate import (
+    parse_source,
     service_to_row,
     services_to_rows,
     severity_for,
@@ -52,9 +53,14 @@ class TestSeverityFor:
         assert severity_for(auth_method) == Severity.cleared
 
     def test_every_auth_method_is_pinned(self):
-        # severity_for clears whatever it does not name, so a new AuthMethod
-        # has to be placed in a tier here before it can slip through as cleared.
+        # severity_for sends whatever it does not name to review, so a new
+        # AuthMethod has to be given a deliberate tier here rather than
+        # defaulting there.
         assert set(self.BLOCKERS + self.REVIEW + self.CLEARED) == set(AuthMethod)
+
+    def test_published_is_never_derived_from_a_method(self):
+        # Only the published-origins registry sets it (core.jobs).
+        assert Severity.published not in {severity_for(m) for m in AuthMethod}
 
 
 class TestTagToAuthMethod:
@@ -367,6 +373,37 @@ class TestTracerUrlToRow:
             'dom: <script type="application/json">',
             "dom: referenced file /settings.json",
         ]
+
+    @pytest.mark.parametrize("source", ["dom", "config: /x", "page: https://app/", "network:", ""])
+    def test_source_outside_the_provenance_vocabulary_raises(self, source):
+        # Like a verdict outside AuthMethod: a string the API could give no kind
+        # (Service.sources) is a producer that drifted, and is refused here
+        # rather than failing every read of the service.
+        with pytest.raises(ValueError):
+            tracer_url_to_row("service-1", _probed("https://api.example.com/x", sources=[source]))
+
+
+class TestParseSource:
+    @pytest.mark.parametrize("source, expected", [
+        ("network: https://app/config.json", (SourceKind.network, "https://app/config.json")),
+        ("js: https://app/main.js", (SourceKind.js, "https://app/main.js")),
+        ('dom: <script type="application/json">', (SourceKind.dom, '<script type="application/json">')),
+        ("dom: inline script (window.__CONFIG__)", (SourceKind.dom, "inline script (window.__CONFIG__)")),
+        ("redirect: https://sso/start", (SourceKind.redirect, "https://sso/start")),
+        ("synthesized: https://api/v1/data", (SourceKind.synthesized, "https://api/v1/data")),
+    ])
+    def test_splits_the_kind_from_what_it_names(self, source, expected):
+        assert parse_source(source) == expected
+
+    def test_splits_at_the_first_separator(self):
+        # What a dom source names is prose, and may carry the separator itself.
+        assert parse_source("dom: referenced file /a: b.js") == (SourceKind.dom, "referenced file /a: b.js")
+
+    @pytest.mark.parametrize("source", ["dom", "config: /x", "page: https://app/", "network:", ""])
+    def test_outside_the_tracers_vocabulary_raises(self, source):
+        # page is the interceptor's kind, never a stored string; the rest name no kind.
+        with pytest.raises(ValueError):
+            parse_source(source)
 
 
 class TestTracerReportToRows:
