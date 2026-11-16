@@ -4,20 +4,22 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from config_tracer.settings import ScanSettings
-from core import jobs
+from core import exposures, jobs
 from core.db import (
     AppRow,
     ScanJobRow,
     ScanRow,
+    ServiceFindingRow,
     ServiceRow,
     SubmissionRow,
     UrlRow,
     load_services,
+    unresolved_count,
 )
 from core.enums import AuthMethod, JobStatus, Scanner, ScanStatus, Severity
 from core.events import emit_event
@@ -40,13 +42,26 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# The auth methods a manual correction may replace, and so never set: the ones
-# that mean the scanners could not tell what the service takes.
+# The scanners' verdicts that mean they could not tell what the service takes.
+# A person may fill one in, but never set one: only the scanners say they could
+# not tell.
 _FILL_IN_AUTH_METHODS = (
-    AuthMethod.unknown.value,
-    AuthMethod.no_response.value,
-    AuthMethod.dns_failed.value,
+    AuthMethod.unknown,
+    AuthMethod.no_response,
+    AuthMethod.dns_failed,
 )
+
+# What a person may set a service's auth method to, by the scanners' verdict
+# for it. A verdict not here is a detected method and stays locked. negotiate is
+# SPNEGO whose mechanism went unresolved, so only the mechanism may be named.
+# Setting the verdict itself is always allowed: it undoes a correction.
+_MANUAL_AUTH_TARGETS: dict[AuthMethod, frozenset[AuthMethod]] = {
+    **{
+        verdict: frozenset(AuthMethod) - frozenset(_FILL_IN_AUTH_METHODS)
+        for verdict in _FILL_IN_AUTH_METHODS
+    },
+    AuthMethod.negotiate: frozenset({AuthMethod.kerberos, AuthMethod.ntlm}),
+}
 
 
 def _session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
@@ -62,19 +77,8 @@ def _summary_aggregates_subq():
         select(
             ServiceRow.scan_id.label("scan_id"),
             func.count(ServiceRow.id).label("service_count"),
-            func.coalesce(
-                func.sum(
-                    case(
-                        (
-                            (ServiceRow.severity == Severity.blocker.value)
-                            & (ServiceRow.excluded.is_(False)),
-                            1,
-                        ),
-                        else_=0,
-                    )
-                ),
-                0,
-            ).label("blocker_count"),
+            unresolved_count(Severity.blocker).label("blocker_count"),
+            unresolved_count(Severity.review).label("review_count"),
             func.count(func.distinct(ServiceRow.auth_method)).label("auth_count"),
         )
         .group_by(ServiceRow.scan_id)
@@ -113,6 +117,7 @@ async def list_scans(request: Request) -> List[ScanSummary]:
             select(
                 ScanRow,
                 func.coalesce(agg.c.blocker_count, 0).label("blocker_count"),
+                func.coalesce(agg.c.review_count, 0).label("review_count"),
                 func.coalesce(agg.c.service_count, 0).label("service_count"),
                 SubmissionRow.submitted_at,
                 SubmissionRow.submitted_by,
@@ -123,11 +128,12 @@ async def list_scans(request: Request) -> List[ScanSummary]:
         )
         result = await session.execute(stmt)
         out: list[ScanSummary] = []
-        for scan, blocker_count, service_count, submitted_at, submitted_by in result.all():
+        for scan, blocker_count, review_count, service_count, submitted_at, submitted_by in result.all():
             out.append(
                 scan_to_summary(
                     scan,
                     blocker_count=int(blocker_count or 0),
+                    review_count=int(review_count or 0),
                     service_count=int(service_count or 0),
                     submitted_at=submitted_at,
                     submitted_by=submitted_by,
@@ -145,6 +151,7 @@ async def get_scan(scan_id: str, request: Request) -> ScanDetail:
             select(
                 ScanRow,
                 func.coalesce(agg.c.blocker_count, 0),
+                func.coalesce(agg.c.review_count, 0),
                 func.coalesce(agg.c.service_count, 0),
                 func.coalesce(agg.c.auth_count, 0),
                 SubmissionRow.submitted_at,
@@ -157,7 +164,7 @@ async def get_scan(scan_id: str, request: Request) -> ScanDetail:
         row = (await session.execute(stmt)).first()
         if not row:
             raise HTTPException(status_code=404, detail={"message": "scan not found"})
-        scan, blocker_count, service_count, auth_count, submitted_at, submitted_by = row
+        scan, blocker_count, review_count, service_count, auth_count, submitted_at, submitted_by = row
         jobs = (
             await session.execute(
                 select(ScanJobRow)
@@ -168,6 +175,7 @@ async def get_scan(scan_id: str, request: Request) -> ScanDetail:
         return scan_to_detail(
             scan,
             blocker_count=int(blocker_count or 0),
+            review_count=int(review_count or 0),
             service_count=int(service_count or 0),
             auth_methods=int(auth_count or 0),
             jobs=jobs,
@@ -218,14 +226,7 @@ async def create_scan(body: CreateScanRequest, request: Request) -> CreateScanRe
         existing_app = await session.get(AppRow, body.app_id)
         if not existing_app:
             raise HTTPException(status_code=404, detail={"message": "app not found"})
-        # The scan always targets the app's own URL — it's no longer supplied per
-        # scan. Apps are created with a required URL, but guard for legacy rows
-        # that predate that rule so we never start a scrape without a start URL.
-        if not existing_app.url:
-            raise HTTPException(
-                status_code=422,
-                detail={"message": "app has no URL configured; cannot start a scan"},
-            )
+        # The scan always targets the app's own URL, which every app has.
         name = existing_app.name
         start_url = existing_app.url
         session.add(
@@ -302,19 +303,28 @@ async def patch_service(
         if body.auth_method is not None:
             # Manual auth correction is allowed only as a fill-in for what the
             # scanners couldn't classify ("unknown"), never got an answer from
-            # ("no_response") or couldn't resolve ("dns_failed") — never to
-            # override an auto-detected method, and never back to any of them.
-            # "other" (a real but unnamed challenge) counts as classified, so
-            # it stays locked here too.
-            if service.auth_method not in _FILL_IN_AUTH_METHODS:
+            # ("no_response") or couldn't resolve ("dns_failed"), or as the
+            # mechanism of a SPNEGO challenge ("negotiate") — never to override
+            # an auto-detected method. "other" (a real but unnamed challenge)
+            # counts as classified, so it stays locked here too. Keyed by the
+            # scanners' verdict, not the current label, so a correction can be
+            # corrected again or undone until the scan is submitted.
+            findings = (
+                await session.execute(
+                    select(ServiceFindingRow).where(ServiceFindingRow.service_id == service_id)
+                )
+            ).scalars()
+            verdict = jobs.scanners_verdict(service, findings).auth_method
+            targets = _MANUAL_AUTH_TARGETS.get(verdict)
+            if targets is None:
                 raise HTTPException(
                     status_code=409,
-                    detail={"message": "auth method can only be set manually while it is unknown, no_response or dns_failed"},
+                    detail={"message": "auth method can only be set manually when the scanners found it unknown, no_response, dns_failed or negotiate"},
                 )
-            if body.auth_method.value in _FILL_IN_AUTH_METHODS:
+            if body.auth_method is not verdict and body.auth_method not in targets:
                 raise HTTPException(
                     status_code=422,
-                    detail={"message": f"cannot set auth method to {body.auth_method.value}"},
+                    detail={"message": f"cannot set auth method to {body.auth_method.value} when the scanners found {verdict.value}"},
                 )
             service.auth_method = body.auth_method.value
             # Severity is derived from the auth method, so re-derive it using
@@ -373,21 +383,20 @@ async def submit_scan(scan_id: str, request: Request) -> SubmitScanResponse:
                 detail={"message": "this scan has already been submitted"},
             )
 
-        unresolved_blockers = (
+        # A review blocks too: submitting would vouch for a service no one has
+        # told apart yet. Filling in its method or excluding it resolves it.
+        blockers, reviews = (
             await session.execute(
-                select(func.count())
-                .select_from(ServiceRow)
-                .where(
-                    ServiceRow.scan_id == scan_id,
-                    ServiceRow.severity == Severity.blocker.value,
-                    ServiceRow.excluded.is_(False),
-                )
+                select(unresolved_count(Severity.blocker), unresolved_count(Severity.review))
+                .where(ServiceRow.scan_id == scan_id)
             )
-        ).scalar_one()
-        if unresolved_blockers:
+        ).one()
+        if blockers or reviews:
+            unresolved = [f"{blockers} unresolved blocker(s)"] if blockers else []
+            unresolved += [f"{reviews} service(s) to review"] if reviews else []
             raise HTTPException(
                 status_code=409,
-                detail={"message": f"{unresolved_blockers} unresolved blocker(s) remain"},
+                detail={"message": f"{' and '.join(unresolved)} remain"},
             )
 
         # Load AppRow *before* staging the new SubmissionRow — otherwise the
@@ -395,10 +404,12 @@ async def submit_scan(scan_id: str, request: Request) -> SubmitScanResponse:
         # outside our commit's try/except.
         app_row = await session.get(AppRow, scan.app_id)
         submission_id = "sub_" + uuid.uuid4().hex[:10]
+        submitted_at = datetime.now(timezone.utc)
         session.add(
             SubmissionRow(
                 id=submission_id,
                 scan_id=scan_id,
+                submitted_at=submitted_at,
                 submitted_by=_STUB_USER.username,
             )
         )
@@ -406,7 +417,9 @@ async def submit_scan(scan_id: str, request: Request) -> SubmitScanResponse:
         if app_row is not None:
             app_row.current_scan_id = scan_id
         try:
-            await session.commit()
+            # Flushed on its own, so the try catches only the submission's
+            # unique constraint, not an error from the exposure below.
+            await session.flush()
         except IntegrityError:
             # Lost a race: another submit committed first and the unique
             # constraint on submissions.scan_id rejected ours. The in-transaction
@@ -416,6 +429,16 @@ async def submit_scan(scan_id: str, request: Request) -> SubmitScanResponse:
                 status_code=409,
                 detail={"message": "this scan has already been submitted"},
             )
+        # The exposure that publishes it, in the same transaction, so the F5
+        # admins' queue never misses a submission.
+        await exposures.create_for_submission(
+            session,
+            app_id=scan.app_id,
+            scan_id=scan_id,
+            submitted_by=_STUB_USER.username,
+            now=submitted_at,
+        )
+        await session.commit()
         return SubmitScanResponse(submission_id=submission_id)
 
 
