@@ -21,7 +21,7 @@ from core.db import (
     load_services,
     unresolved_count,
 )
-from core.enums import AuthMethod, JobStatus, Scanner, ScanStatus, Severity
+from core.enums import FILL_IN_AUTH_METHODS, AuthMethod, JobStatus, Scanner, ScanStatus, Severity
 from core.events import emit_event
 from core.translate import severity_for
 
@@ -42,23 +42,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# The scanners' verdicts that mean they could not tell what the service takes.
-# A person may fill one in, but never set one: only the scanners say they could
-# not tell.
-_FILL_IN_AUTH_METHODS = (
-    AuthMethod.unknown,
-    AuthMethod.no_response,
-    AuthMethod.dns_failed,
-)
-
 # What a person may set a service's auth method to, by the scanners' verdict
 # for it. A verdict not here is a detected method and stays locked. negotiate is
 # SPNEGO whose mechanism went unresolved, so only the mechanism may be named.
 # Setting the verdict itself is always allowed: it undoes a correction.
 _MANUAL_AUTH_TARGETS: dict[AuthMethod, frozenset[AuthMethod]] = {
     **{
-        verdict: frozenset(AuthMethod) - frozenset(_FILL_IN_AUTH_METHODS)
-        for verdict in _FILL_IN_AUTH_METHODS
+        verdict: frozenset(AuthMethod) - frozenset(FILL_IN_AUTH_METHODS)
+        for verdict in FILL_IN_AUTH_METHODS
     },
     AuthMethod.negotiate: frozenset({AuthMethod.kerberos, AuthMethod.ntlm}),
 }

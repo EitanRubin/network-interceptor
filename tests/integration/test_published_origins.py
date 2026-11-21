@@ -39,7 +39,7 @@ async def _add_scan(factory, status="running", *, app_id=None) -> tuple[str, str
     scan_id = uuid.uuid4().hex
     async with factory() as session:
         if new_app:
-            session.add(AppRow(id=app_id, name="app", url="http://x", owner_ad_group="g"))
+            session.add(AppRow(id=app_id, name="app", url="http://x", owner_ad_group="g", auth_method="oauth"))
         session.add(ScanRow(
             id=scan_id, app_id=app_id, name="app", url="http://x", status=status, started_by="test",
         ))

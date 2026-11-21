@@ -22,7 +22,7 @@ async def _add_service(
     columns of the service row."""
     app_id, scan_id, service_id = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
     async with factory() as session:
-        session.add(AppRow(id=app_id, name="app", url="http://x", owner_ad_group="g"))
+        session.add(AppRow(id=app_id, name="app", url="http://x", owner_ad_group="g", auth_method="oauth"))
         session.add(ScanRow(
             id=scan_id, app_id=app_id, name="app", url="http://x",
             status="completed", started_by="test",

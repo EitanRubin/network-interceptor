@@ -20,6 +20,16 @@ class AuthMethod(str, Enum):
     unknown = "unknown"
 
 
+# The scanners' verdicts that mean they could not tell what an origin takes.
+# A person may fill one in, but never set one: only the scanners say they could
+# not tell. Neither a service's correction nor an app's own method is one.
+FILL_IN_AUTH_METHODS = (
+    AuthMethod.unknown,
+    AuthMethod.no_response,
+    AuthMethod.dns_failed,
+)
+
+
 class Severity(str, Enum):
     blocker = "blocker"
     review = "review"

@@ -63,6 +63,9 @@ class Base(DeclarativeBase):
 
 class AppRow(Base):
     __tablename__ = "apps"
+    __table_args__ = (
+        _one_of("apps", "auth_method", AuthMethod),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
@@ -70,6 +73,12 @@ class AppRow(Base):
     # is built from it too. Required, and checked when the app is created.
     url: Mapped[str] = mapped_column(String, nullable=False)
     owner_ad_group: Mapped[str] = mapped_column(String, nullable=False, default="")
+    # How the app signs its own users in, as whoever registered it declared:
+    # the scans record auth methods only for the services an app calls. An
+    # AuthMethod value; the CHECK allows the whole vocabulary, and creating an
+    # app narrows it to api.models.APP_AUTH_METHODS. No default: an app the
+    # API never asked about must not read as one that clears.
+    auth_method: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     # Canonical "current version" — the scan that was most recently submitted for
     # this app. Sticky: stays set across subsequent unsubmitted scans, only moves

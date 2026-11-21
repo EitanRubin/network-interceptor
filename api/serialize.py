@@ -217,6 +217,7 @@ def app_to_summary(
         name=app.name,
         url=app.url,
         owner_ad_group=app.owner_ad_group or "",
+        auth_method=AuthMethod(app.auth_method),
         exposure_state=derive_exposure_state(
             last_scan.status if last_scan else None,
             last_scan_unresolved_count,

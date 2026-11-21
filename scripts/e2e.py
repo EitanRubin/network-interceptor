@@ -316,7 +316,7 @@ async def check_no_chromium_left(name, baseline):
 # ---------------------------------------------------------------- API client
 
 async def create_app(http, path):
-    body = {"name": f"e2e {path}", "url": SITE + path, "owner_ad_group": "e2e"}
+    body = {"name": f"e2e {path}", "url": SITE + path, "owner_ad_group": "e2e", "auth_method": "oauth"}
     async with http.post(f"{API}/api/apps", json=body) as r:
         assert r.status == 201, await r.text()
         return (await r.json())["id"]

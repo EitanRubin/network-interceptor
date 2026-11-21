@@ -14,6 +14,7 @@ from core.db import (
     load_services,
     unresolved_count,
 )
+from core import exposures
 from core.enums import AuthMethod, Severity
 
 from .models import (
@@ -21,11 +22,13 @@ from .models import (
     AuthMethodChange,
     CreateAppRequest,
     ExclusionChange,
+    PatchAppRequest,
     PublishedChange,
     ScanDiff,
     ScanSummary,
     Service,
 )
+from .routes_me import _STUB_USER
 from .serialize import app_to_summary, scan_to_summary, service_to_schema
 
 router = APIRouter()
@@ -106,12 +109,41 @@ async def create_app(body: CreateAppRequest, request: Request) -> AppSummary:
             name=body.name,
             url=body.url,
             owner_ad_group=body.owner_ad_group,
+            auth_method=body.auth_method.value,
         )
         session.add(app)
         await session.commit()
         await session.refresh(app)
 
     return app_to_summary(app, last_scan=None, last_scan_unresolved_count=0)
+
+
+@router.patch("/apps/{app_id}", response_model=AppSummary)
+async def patch_app(app_id: str, body: PatchAppRequest, request: Request) -> AppSummary:
+    """Rename the app, change its owner group, or correct its declared auth
+    method. A change of auth method is recorded on the app's open exposure,
+    if it has one, and the workspace following it reloads."""
+    factory = _session_factory(request)
+    async with factory() as session:
+        app = await session.get(AppRow, app_id)
+        if app is None:
+            raise HTTPException(status_code=404, detail={"message": "app not found"})
+        if body.name is not None:
+            app.name = body.name
+        if body.owner_ad_group is not None:
+            app.owner_ad_group = body.owner_ad_group
+        if body.auth_method is not None and body.auth_method.value != app.auth_method:
+            await exposures.notify_open_exposures(
+                session,
+                "app_auth_method_set",
+                _STUB_USER.username,
+                {"before": app.auth_method, "after": body.auth_method.value},
+                app_id=app_id,
+            )
+            app.auth_method = body.auth_method.value
+        await session.commit()
+        [summary] = await _app_summaries(session, app_id)
+        return summary
 
 
 @router.get("/apps/{app_id}/scans", response_model=List[ScanSummary])

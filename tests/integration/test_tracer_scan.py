@@ -40,7 +40,7 @@ async def _scan_with_a_tracer_worker(factory, url: str) -> str:
     claim the scan's tracer job and run it. Returns the scan id."""
     app_id = uuid.uuid4().hex
     async with factory() as session:
-        session.add(AppRow(id=app_id, name="app", url=url, owner_ad_group="g"))
+        session.add(AppRow(id=app_id, name="app", url=url, owner_ad_group="g", auth_method="oauth"))
         await session.commit()
     scan_id = (await create_scan(CreateScanRequest(app_id=app_id), _request(factory))).scan_id
     job = Job(await claim_next(factory, Scanner.tracer, "tracer-worker"))

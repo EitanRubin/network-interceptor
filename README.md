@@ -81,13 +81,15 @@ A scan belongs to an app. Create the app, then scan it:
 
 ```powershell
 $app = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/apps -ContentType "application/json" `
-    -Body '{"name": "Practice", "url": "https://practicesoftwaretesting.com", "owner_ad_group": "dev"}'
+    -Body '{"name": "Practice", "url": "https://practicesoftwaretesting.com", "owner_ad_group": "dev", "auth_method": "unauthenticated"}'
 $scan = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/scans -ContentType "application/json" `
     -Body (@{ app_id = $app.id } | ConvertTo-Json)
 
 Invoke-RestMethod "http://127.0.0.1:8000/api/scans/$($scan.scan_id)"            # status and the two jobs
 Invoke-RestMethod "http://127.0.0.1:8000/api/scans/$($scan.scan_id)/services"   # combined results
 ```
+
+An app's `auth_method` is how it signs its own users in, which its scans don't record: they record auth methods only for the services the app calls. It must be `oauth` (a redirect to an external identity provider), `login_redirect` (a login page of its own), `kerberos` or `unauthenticated`. An app that takes NTLM, Basic or another method the F5 cannot publish (a `blocker`) is unsupported and refused, as are `negotiate`, which the person registering the app can resolve to Kerberos or NTLM, and `bearer` and `api_key`, which are how APIs are called. Apps created before the field existed were all OAuth, and the migration set them to `oauth`.
 
 The scan body also takes `max_depth` (1 to 10) for the interceptor's crawl.
 
@@ -99,7 +101,8 @@ All under `/api`, except `/health`.
 
 | Method | Path | Does |
 |---|---|---|
-| `GET`, `POST` | `/apps` | List the apps; create one (`name`, `url`, `owner_ad_group`) |
+| `GET`, `POST` | `/apps` | List the apps; create one (`name`, `url`, `owner_ad_group`, `auth_method`) |
+| `PATCH` | `/apps/{id}` | Change the app's `name`, `owner_ad_group` or `auth_method`, each optional. Not its `url`: an app at another URL is a new app. A change of `auth_method` is recorded on the app's open exposure |
 | `GET` | `/apps/{id}/scans` | The app's scans |
 | `GET` | `/apps/{id}/diff?from=&to=` | What changed between two of the app's scans |
 | `POST` | `/scans` | Start a scan (`app_id`, optional `max_depth`); returns `scan_id` |

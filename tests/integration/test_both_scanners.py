@@ -50,7 +50,7 @@ def _request(factory, **headers) -> SimpleNamespace:
 
 async def _request_scan(factory) -> str:
     """Create an app and request a scan of it, through the routes. Returns the scan id."""
-    app = await create_app(CreateAppRequest(name="app", url=APP_URL, owner_ad_group="g"), _request(factory))
+    app = await create_app(CreateAppRequest(name="app", url=APP_URL, owner_ad_group="g", auth_method="oauth"), _request(factory))
     return (await create_scan(CreateScanRequest(app_id=app.id), _request(factory))).scan_id
 
 

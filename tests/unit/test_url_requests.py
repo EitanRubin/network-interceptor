@@ -7,7 +7,7 @@ from api.models import CreateAppRequest, PatchPublishedOriginRequest
 
 
 def _app(url: str) -> CreateAppRequest:
-    return CreateAppRequest(name="Payroll", url=url, owner_ad_group="g")
+    return CreateAppRequest(name="Payroll", url=url, owner_ad_group="g", auth_method="oauth")
 
 
 @pytest.mark.parametrize("given, stored", [

@@ -40,7 +40,7 @@ async def _add_scan(factory, status="queued", *, cancel_requested_at=None, trace
     if tracer is not None:
         jobs[TRACER] = tracer
     async with factory() as session:
-        session.add(AppRow(id=app_id, name="app", url="http://x", owner_ad_group="g"))
+        session.add(AppRow(id=app_id, name="app", url="http://x", owner_ad_group="g", auth_method="oauth"))
         session.add(ScanRow(
             id=scan_id, app_id=app_id, name="app", url="http://x",
             status=status, started_by="test", cancel_requested_at=cancel_requested_at,

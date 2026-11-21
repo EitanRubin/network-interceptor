@@ -5,6 +5,7 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from core.enums import (
+    FILL_IN_AUTH_METHODS,
     AuthMethod,
     ExposurePhase,
     ExposureScope,
@@ -15,6 +16,7 @@ from core.enums import (
     Severity,
     SourceKind,
 )
+from core.translate import severity_for
 
 
 class ExposureState(str, Enum):
@@ -238,6 +240,8 @@ class AppSummary(BaseModel):
     name: str
     url: Optional[str] = None
     owner_ad_group: str
+    # How the app signs its own users in (CreateAppRequest.auth_method).
+    auth_method: AuthMethod
     exposure_state: ExposureState
     last_scan_id: Optional[str] = None
     last_scan_status: Optional[ScanStatus] = None
@@ -436,6 +440,27 @@ class SaveGroupingRequest(BaseModel):
     version: int
     groups: List[GroupInput]
 
+# What an app's own auth method may be declared as. Not a verdict only the
+# scanners give (FILL_IN_AUTH_METHODS); not negotiate, since whoever registers
+# the app knows whether it is Kerberos or NTLM; not a blocker, since such an
+# app cannot be published at all; and not bearer or api_key, which are how
+# APIs are called, not how a person signs in to an app.
+APP_AUTH_METHODS = frozenset(
+    method
+    for method in AuthMethod
+    if method not in FILL_IN_AUTH_METHODS
+    and method not in (AuthMethod.negotiate, AuthMethod.bearer, AuthMethod.api_key)
+    and severity_for(method) is not Severity.blocker
+)
+
+
+def _app_auth_method(value: AuthMethod) -> AuthMethod:
+    if value not in APP_AUTH_METHODS:
+        allowed = ", ".join(sorted(method.value for method in APP_AUTH_METHODS))
+        raise ValueError(f"an app's auth method must be one of: {allowed}")
+    return value
+
+
 class CreateAppRequest(BaseModel):
     name: str
     # Where the app is reached: its scans start here, and its exposure's VIP
@@ -443,6 +468,13 @@ class CreateAppRequest(BaseModel):
     # since a scan may need to start on a particular page.
     url: str
     owner_ad_group: str
+    # How the app signs its own users in, which its scans do not record.
+    auth_method: AuthMethod
+
+    @field_validator("auth_method")
+    @classmethod
+    def _supported_auth_method(cls, value: AuthMethod) -> AuthMethod:
+        return _app_auth_method(value)
 
     @field_validator("url")
     @classmethod
@@ -459,6 +491,25 @@ class CreateAppRequest(BaseModel):
             raise ValueError("the URL must not carry credentials")
         parts.port  # raises ValueError for a port out of range
         return value
+
+
+class PatchAppRequest(BaseModel):
+    """What may change on an app: its labels and its declared auth method.
+    Each field is optional, and a body with none is a no-op. Not the URL: the
+    app's scans, its submission and what its deploys registered all describe
+    the URL it was created with, so an app at another URL is a new app. An
+    unknown field, `url` among them, is refused rather than ignored."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = None
+    owner_ad_group: Optional[str] = None
+    auth_method: Optional[AuthMethod] = None
+
+    @field_validator("auth_method")
+    @classmethod
+    def _supported_auth_method(cls, value: Optional[AuthMethod]) -> Optional[AuthMethod]:
+        return None if value is None else _app_auth_method(value)
 
 
 _ORIGIN_SCHEMES = ("http", "https")

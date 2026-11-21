@@ -10,7 +10,8 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select, update
 
-from api.models import GroupInput, PatchPublishedOriginRequest, SaveGroupingRequest
+from api.models import GroupInput, PatchAppRequest, PatchPublishedOriginRequest, SaveGroupingRequest
+from api.routes_apps import patch_app
 from api.routes_exposures import exposure_events, get_exposure, list_exposures, save_groups
 from api.routes_published_origins import patch_published_origin
 from api.routes_scans import submit_scan
@@ -49,7 +50,7 @@ async def _scan(factory, services, *, app_id=None, app_url="https://app.internal
     scan_id = uuid.uuid4().hex
     async with factory() as session:
         if new_app:
-            session.add(AppRow(id=app_id, name="Payroll", url=app_url, owner_ad_group="g"))
+            session.add(AppRow(id=app_id, name="Payroll", url=app_url, owner_ad_group="g", auth_method="oauth"))
         session.add(ScanRow(id=scan_id, app_id=app_id, name="Payroll", url=app_url or "http://x",
                             status="completed", started_by="test"))
         await session.flush()
@@ -457,3 +458,29 @@ class TestFixingBlockers:
             patch_published_origin(entry, PatchPublishedOriginRequest(url="https://p.example.com"), _request(factory))
         )
         assert error.status_code == 404
+
+
+class TestAppChanges:
+    async def test_an_auth_method_change_is_recorded_on_the_open_exposure_only(self, factory):
+        app_id, _, superseded = await _submitted(factory, [svc("a")])
+        _, _, current = await _submitted(factory, [svc("a")], app_id=app_id)
+        assert (await _exposure_of(factory, superseded.scan_id)).status == "superseded"
+
+        await patch_app(app_id, PatchAppRequest(auth_method="kerberos"), _request(factory))
+
+        assert (await _events(factory, current.id))[-1] == (
+            "app_auth_method_set", "jchen", {"before": "oauth", "after": "kerberos"},
+        )
+        assert "app_auth_method_set" not in [t for t, *_ in await _events(factory, superseded.id)]
+
+    async def test_other_changes_record_nothing(self, factory):
+        app_id, _, exposure = await _submitted(factory, [svc("a")])
+        before = await _events(factory, exposure.id)
+
+        # A rename, a new owner, and the method it already has.
+        await patch_app(
+            app_id, PatchAppRequest(name="Payroll 2", owner_ad_group="finance", auth_method="oauth"),
+            _request(factory),
+        )
+
+        assert await _events(factory, exposure.id) == before

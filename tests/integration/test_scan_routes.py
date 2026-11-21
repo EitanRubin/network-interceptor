@@ -22,7 +22,7 @@ async def _create_scan(factory, max_depth=None, **state) -> str:
     """Request a scan of a new app, through the route."""
     app_id = uuid.uuid4().hex
     async with factory() as session:
-        session.add(AppRow(id=app_id, name="app", url="http://x", owner_ad_group="g"))
+        session.add(AppRow(id=app_id, name="app", url="http://x", owner_ad_group="g", auth_method="oauth"))
         await session.commit()
     body = CreateScanRequest(app_id=app_id, max_depth=max_depth)
     return (await create_scan(body, _request(factory, **state))).scan_id
